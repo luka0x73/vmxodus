@@ -37,7 +37,7 @@ In the guest:
 
 - Uninstall VMware Tools and install `qemu-guest-agent`.
 - Linux needs `virtio_scsi` in the initramfs.
-- Windows needs the VirtIO drivers installed beforehand, or use `--disk-bus=sata`.
+- Windows needs the VirtIO drivers installed beforehand, or use `--disk-bus=sata`. The [load-virtio-scsi-on-boot](https://github.com/croit/load-virtio-scsi-on-boot) script by croit prepares Windows guests without a reboot.
 - Interface names change (e.g. `ens192` becomes `ens18`) while the MAC addresses are kept. Bind the network configuration to the MAC, not to the interface name.
 
 ## Installation
