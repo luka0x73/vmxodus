@@ -1,0 +1,1783 @@
+#!/usr/bin/env bash
+# vmxodus - migrate VMware VMs to Proxmox VE with minimal downtime.
+#
+# The VM data already sits on an NFS share mounted on ESXi and PVE (moved
+# there via Storage vMotion). vmxodus builds the PVE VM from the .vmx,
+# renames the raw flat files into the PVE image layout and attaches them.
+# No disk data is ever copied, converted or deleted.
+set -euo pipefail
+shopt -s nullglob inherit_errexit
+
+readonly EXIT_ERROR=1
+readonly EXIT_USAGE=2
+readonly EXIT_LOCKED=3
+
+readonly DESCRIPTOR_MAX_BYTES=65536
+readonly WAIT_INTERVAL=5
+readonly WAIT_DEFAULT_TIMEOUT=600
+
+VMXODUS_CONF="${VMXODUS_CONF:-/etc/vmxodus.conf}"
+
+DRY_RUN=0
+ASSUME_YES=0
+
+# Logging, see start_log / stop_log.
+LOG_PATH=""
+LOG_ORIG_OUT=""   # fd of the original stdout while logging
+LOG_ORIG_ERR=""   # fd of the original stderr while logging
+LOG_PIDS=()       # tee processes
+
+# Exit handling, see install_traps.
+EXIT_HOOK=""      # function called with the exit code before exit
+ERR_INFO=""       # last failed command, set by the ERR trap
+CAUGHT_SIGNAL=""
+
+# Progress of cutover, reported by cutover_report on any abnormal exit.
+CUTOVER_VM=""
+CUTOVER_STEP=""
+CUTOVER_ROLLBACK=""
+CUTOVER_MOVED=0
+CUTOVER_ATTACHED=0
+CUTOVER_PENDING=()  # src and dst of a mv not yet recorded in the rollback file
+
+# Parsed .vmx, keys lowercased.
+declare -gA VMX=()
+KV_KEY=""
+KV_VALUE=""
+
+# Derived VM config, filled by derive_config.
+CFG_NAME=""
+CFG_CORES=""
+CFG_SOCKETS=""
+CFG_MEMORY=""
+CFG_BIOS=""
+CFG_EFI=0
+CFG_SECUREBOOT=0
+CFG_OSTYPE=""
+CFG_OSTYPE_WARNING=""
+
+# Disks in target order, filled by resolve_disks.
+DISK_DEVS=()      # vmx device, e.g. scsi0:1
+DISK_DESCS=()     # descriptor path
+DISK_SOURCES=()   # flat file path
+DISK_SLOTS=()     # PVE slot, e.g. scsi1
+DISK_TARGETS=()   # target file name, e.g. vm-100-disk-1.raw
+
+# State of one VM, see state_load / state_save.
+VMID=""
+NODE=""
+STATUS=""
+PREPARED_AT=""
+MIGRATED_AT=""
+
+THIS_NODE="${HOSTNAME%%.*}"
+
+# NICs from the .vmx, filled by vmx_nics, and their assignment.
+NIC_IDXS=()
+NIC_MACS=()
+NIC_KEYS=()
+NIC_BRIDGES=()
+NIC_TAGS=()
+NIC_LABELS=()
+BRIDGES=()        # bridges on this node
+
+# Options for qm create, filled by build_create_opts. Keys in qm create
+# order, values and their origin (vmx, config, EXTRA_OPTS, set).
+OPT_KEYS=()
+declare -gA OPT_VALUES=()
+declare -gA OPT_SOURCES=()
+
+# Per-VM choices, persisted in the state file.
+VM_DISK_BUS=""    # scsi, sata or virtio
+SET_OPTS=()       # key=value from --set and the interactive prompt
+
+# Keys that cannot be set via EXTRA_OPTS, --set or the prompt.
+readonly RESERVED_OPT_RE='^((scsi|sata|virtio|ide)[0-9]+|boot|bios|efidisk0|vmid)$'
+
+# Result of map_lookup.
+MAP_BRIDGE=""
+MAP_TAG=""
+MAP_LABEL=""
+
+# ---------------------------------------------------------------------------
+# Output helpers
+# ---------------------------------------------------------------------------
+
+info() { printf '%s\n' "$*" >&2; }
+warn() { printf 'WARNING: %s\n' "$*" >&2; }
+
+# die <message> [exit code]
+die() {
+  printf 'ERROR: %s\n' "$1" >&2
+  exit "${2:-$EXIT_ERROR}"
+}
+
+usage_error() {
+  printf 'ERROR: %s\n' "$1" >&2
+  usage >&2
+  exit "$EXIT_USAGE"
+}
+
+usage() {
+  cat <<'EOF'
+Usage:
+  vmxodus list
+  vmxodus prepare <vm> [--vmid=<id>] [--disk-bus=<bus>] [--set key=value]...
+                       [--yes] [--dry-run]
+  vmxodus cutover <vm> [--start] [--wait[=<seconds>]] [--yes] [--dry-run]
+  vmxodus reset <vm> [--yes] [--dry-run]
+
+<vm> is the VM folder name on the NFS share.
+
+Commands:
+  list      Show all VM folders on the share and their migration status.
+  prepare   Create the PVE VM from the .vmx while the VM still runs in VMware.
+  cutover   After shutdown in vCenter, move the flat files into place and
+            attach them to the PVE VM.
+  reset     Undo prepare for a VM whose flat files were not moved: archive
+            its state and rollback file. Prints the qm destroy hint for the
+            empty PVE VM, does not run it.
+
+Options:
+  --vmid=<id>        Use this VMID instead of the next free one.
+  --disk-bus=<bus>   Disk bus scsi, sata or virtio (default DISK_BUS).
+  --set key=value    Extra qm create option --key value, repeatable. Wins
+                     over config and .vmx values.
+  --yes              Do not ask for confirmation.
+  --dry-run          Print mutating commands instead of running them.
+  --start            Start the VM after cutover.
+  --wait[=<seconds>] Wait for VMware locks to disappear (default 600s).
+
+Configuration: /etc/vmxodus.conf, see vmxodus.conf.example for all keys.
+NFS_STORE is required.
+EOF
+}
+
+# quote_cmd <arg>...: render a command line, quoting only where needed.
+quote_cmd() {
+  local arg out=""
+  for arg in "$@"; do
+    if [[ ! "$arg" =~ ^[A-Za-z0-9_./:=,@%+-]+$ ]]; then
+      arg="'${arg//\'/\'\\\'\'}'"
+    fi
+    out+="${out:+ }$arg"
+  done
+  printf '%s' "$out"
+}
+
+# run <cmd> [arg]...: the single entry point for every mutating command.
+# Prints the command, runs it unless --dry-run.
+run() {
+  if ((DRY_RUN)); then
+    printf '[dry-run] %s\n' "$(quote_cmd "$@")"
+  else
+    printf '+ %s\n' "$(quote_cmd "$@")"
+    "$@"
+  fi
+}
+
+# write_atomic <file> <content>: write via temp file in the same directory.
+write_atomic() {
+  local file=$1 content=$2 tmp
+  tmp=$(mktemp "$file.XXXXXX")
+  printf '%s' "$content" > "$tmp"
+  mv -f "$tmp" "$file"
+}
+
+# append_line <file> <line>
+append_line() {
+  printf '%s\n' "$2" >> "$1"
+}
+
+# start_log <vm> <args>...: append all further output to <vm>.log. The
+# original stdout/stderr are kept on separate fds, so stop_log can restore
+# them and messages can bypass tee when it is gone.
+start_log() {
+  local vm=$1
+  shift
+  ((DRY_RUN)) && return 0
+  LOG_PATH=$(log_file "$vm")
+  exec {LOG_ORIG_OUT}>&1 {LOG_ORIG_ERR}>&2
+  exec > >(tee -a "$LOG_PATH" >&"$LOG_ORIG_OUT")
+  LOG_PIDS+=("$!")
+  exec 2> >(tee -a "$LOG_PATH" >&"$LOG_ORIG_ERR")
+  LOG_PIDS+=("$!")
+  printf '=== %s node %s: vmxodus %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$THIS_NODE" "$*"
+}
+
+# restore_output: point stdout/stderr back to the originals, bypassing tee.
+restore_output() {
+  ((${#LOG_PIDS[@]})) || return 0
+  exec 1>&"$LOG_ORIG_OUT" 2>&"$LOG_ORIG_ERR"
+}
+
+# stop_log: restore the original stdout/stderr and wait until the tee
+# processes have written everything, so no output arrives after exit.
+stop_log() {
+  ((${#LOG_PIDS[@]})) || return 0
+  restore_output
+  wait "${LOG_PIDS[@]}" 2> /dev/null || true
+  LOG_PIDS=()
+}
+
+# report <line>: print to the original stderr and append to the log
+# directly, so it arrives even when the tee processes are gone.
+report() {
+  printf '%s\n' "$1" >&2 2> /dev/null || true
+  if [[ -n "$LOG_PATH" ]]; then
+    printf '%s\n' "$1" >> "$LOG_PATH" 2> /dev/null || true
+  fi
+}
+
+on_err() {
+  ERR_INFO="'$3' failed with exit code $1 at line $2"
+}
+
+# on_signal <name> <exit code>: a dead tee means every further write raises
+# SIGPIPE again, which would abort the exit path before on_exit ran. So
+# ignore SIGPIPE and leave the tee pipes before calling exit.
+on_signal() {
+  trap '' PIPE
+  [[ -n "$CAUGHT_SIGNAL" ]] || CAUGHT_SIGNAL=$1
+  restore_output
+  exit "$2"
+}
+
+on_exit() {
+  local rc=$?
+  trap '' PIPE
+  trap - ERR
+  set +e
+  stop_log
+  if [[ -n "$EXIT_HOOK" ]]; then
+    "$EXIT_HOOK" "$rc"
+  fi
+  exit "$rc"
+}
+
+# install_traps: record failed commands, turn fatal signals into a normal
+# exit and always run on_exit, so vmxodus never dies silently.
+install_traps() {
+  set -E
+  trap 'on_err "$?" "$LINENO" "$BASH_COMMAND"' ERR
+  trap on_exit EXIT
+  trap 'on_signal HUP 129' HUP
+  trap 'on_signal INT 130' INT
+  trap 'on_signal PIPE 141' PIPE
+  trap 'on_signal TERM 143' TERM
+}
+
+# ask <prompt>: prompt on stderr, print the answer on stdout.
+ask() {
+  local answer
+  printf '%s' "$1" >&2
+  IFS= read -r answer || die "no input on stdin"
+  printf '%s' "$answer"
+}
+
+# confirm <question>: default no.
+confirm() {
+  local answer
+  answer=$(ask "$1 [y/N] ") || exit
+  [[ "${answer,,}" == "y" || "${answer,,}" == "yes" ]]
+}
+
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
+
+load_config() {
+  NFS_STORE=""
+  NFS_PATH=""
+  STATE_DIR=""
+  CPU_TYPE="x86-64-v2-AES"
+  NUMA="1"
+  HOTPLUG="disk,network,usb"
+  SCSIHW="virtio-scsi-single"
+  DISK_OPTS="discard=on,iothread=1,ssd=1"
+  DISK_BUS="scsi"
+  NIC_MODEL="virtio"
+  DEFAULT_BRIDGE="vmbr0"
+  CDROM_SLOT="ide0"
+  EFI_STORE=""
+  AGENT="1"
+  EXTRA_OPTS=()
+
+  if [[ -f "$VMXODUS_CONF" ]]; then
+    # shellcheck source=/dev/null
+    source "$VMXODUS_CONF"
+  fi
+
+  [[ -n "$NFS_STORE" ]] ||
+    die "NFS_STORE is not set. Configure it in $VMXODUS_CONF (see vmxodus.conf.example)"
+  NFS_PATH="${NFS_PATH:-/mnt/pve/$NFS_STORE}"
+  NFS_PATH="${NFS_PATH%/}"
+  STATE_DIR="${STATE_DIR:-$NFS_PATH/.vmxodus}"
+  STATE_DIR="${STATE_DIR%/}"
+  EFI_STORE="${EFI_STORE:-$NFS_STORE}"
+}
+
+# ---------------------------------------------------------------------------
+# .vmx parsing
+# ---------------------------------------------------------------------------
+
+# kv_split <line>: split a vmx/vmsd style key = "value" line into KV_KEY
+# (lowercased) and KV_VALUE (unquoted). Values may contain " = ", so split
+# on the first only. Returns 1 for lines without " = ".
+kv_split() {
+  local line=${1%$'\r'}
+  [[ "$line" == *' = '* ]] || return 1
+  KV_KEY=${line%%' = '*}
+  KV_KEY=${KV_KEY#"${KV_KEY%%[![:space:]]*}"}
+  KV_KEY=${KV_KEY,,}
+  KV_VALUE=${line#*' = '}
+  KV_VALUE=${KV_VALUE#\"}
+  KV_VALUE=${KV_VALUE%\"}
+}
+
+# vmx_load <file>: parse the .vmx into VMX, keys case-insensitive.
+vmx_load() {
+  local file=$1 line
+  VMX=()
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    kv_split "$line" || continue
+    VMX[$KV_KEY]=$KV_VALUE
+  done < "$file"
+}
+
+vmx_get() {
+  printf '%s' "${VMX[${1,,}]-}"
+}
+
+vmx_true() {
+  local value
+  value=$(vmx_get "$1")
+  [[ "${value,,}" == "true" ]]
+}
+
+# sanitize_name <name>: valid DNS label characters only.
+sanitize_name() {
+  local name=$1
+  printf '%s' "${name//[^A-Za-z0-9.-]/-}"
+}
+
+# map_ostype <guestOS>: sets CFG_OSTYPE and CFG_OSTYPE_WARNING.
+map_ostype() {
+  local guest=$1
+  CFG_OSTYPE_WARNING=""
+  case "${guest,,}" in
+    windows7*) CFG_OSTYPE="win7" ;;
+    windows8*) CFG_OSTYPE="win8" ;;
+    windows9* | windows2016srv-64 | windows2019srv-64) CFG_OSTYPE="win10" ;;
+    windows11-64 | windows2019srvnext-64 | windows2022srvnext-64) CFG_OSTYPE="win11" ;;
+    windows*)
+      CFG_OSTYPE="win11"
+      CFG_OSTYPE_WARNING="unknown Windows guestOS '$guest', mapped to win11, please check"
+      ;;
+    *) CFG_OSTYPE="l26" ;;
+  esac
+}
+
+# derive_config: fill CFG_* from VMX. Aborts on missing or invalid values.
+derive_config() {
+  local display vcpus cps mem firmware
+
+  display=$(vmx_get displayName)
+  [[ -n "$display" ]] || die "displayName missing in .vmx"
+  CFG_NAME=$(sanitize_name "$display")
+
+  vcpus=$(vmx_get numvcpus)
+  vcpus=${vcpus:-1}
+  [[ "$vcpus" =~ ^[1-9][0-9]*$ ]] || die "invalid numvcpus '$vcpus'"
+  cps=$(vmx_get cpuid.coresPerSocket)
+  if [[ -z "$cps" ]]; then
+    CFG_SOCKETS=1
+    CFG_CORES=$vcpus
+  else
+    [[ "$cps" =~ ^[1-9][0-9]*$ ]] || die "invalid cpuid.coresPerSocket '$cps'"
+    ((vcpus % cps == 0)) || die "numvcpus $vcpus is not a multiple of cpuid.coresPerSocket $cps"
+    CFG_SOCKETS=$((vcpus / cps))
+    CFG_CORES=$cps
+  fi
+
+  mem=$(vmx_get memSize)
+  [[ "$mem" =~ ^[1-9][0-9]*$ ]] || die "invalid or missing memSize '$mem'"
+  CFG_MEMORY=$mem
+
+  firmware=$(vmx_get firmware)
+  if [[ "${firmware,,}" == "efi" ]]; then
+    CFG_EFI=1
+    CFG_BIOS="ovmf"
+    if vmx_true uefi.secureBoot.enabled; then
+      CFG_SECUREBOOT=1
+    else
+      CFG_SECUREBOOT=0
+    fi
+  else
+    CFG_EFI=0
+    CFG_SECUREBOOT=0
+    CFG_BIOS="seabios"
+  fi
+
+  map_ostype "$(vmx_get guestOS)"
+}
+
+# ---------------------------------------------------------------------------
+# Disks
+# ---------------------------------------------------------------------------
+
+bus_rank() {
+  case "$1" in
+    scsi) echo 0 ;;
+    sata) echo 1 ;;
+    nvme) echo 2 ;;
+    ide) echo 3 ;;
+  esac
+}
+
+# vmx_disk_devs: print present vmdk disk devices (e.g. scsi0:1) in target
+# order: bus rank, controller, unit, all numeric.
+vmx_disk_devs() {
+  local key bus ctrl unit dev file dtype
+  local -a rows=()
+  for key in "${!VMX[@]}"; do
+    [[ "$key" =~ ^(scsi|sata|nvme|ide)([0-9]+):([0-9]+)\.filename$ ]] || continue
+    bus=${BASH_REMATCH[1]}
+    ctrl=${BASH_REMATCH[2]}
+    unit=${BASH_REMATCH[3]}
+    dev="$bus$ctrl:$unit"
+    vmx_true "$dev.present" || continue
+    file=${VMX[$key]}
+    [[ "${file,,}" == *.vmdk ]] || continue
+    dtype=$(vmx_get "$dev.deviceType")
+    [[ "${dtype,,}" == *cdrom* ]] && continue
+    rows+=("$(bus_rank "$bus") $ctrl $unit $dev")
+  done
+  ((${#rows[@]})) || return 0
+  printf '%s\n' "${rows[@]}" | sort -k1,1n -k2,2n -k3,3n | cut -d' ' -f4
+}
+
+# descriptor_flat <descriptor> <vm dir>: validate a vmdk text descriptor
+# and print the absolute path of its single flat extent.
+descriptor_flat() {
+  local desc=$1 dir=$2 size line flat="" extents=0 vmfs=0
+  [[ -f "$desc" ]] || die "descriptor not found: $desc"
+  size=$(stat -c %s "$desc")
+  ((size < DESCRIPTOR_MAX_BYTES)) ||
+    die "$desc is $size bytes, expected a text descriptor (monolithic disk?)"
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    line=${line%$'\r'}
+    case "$line" in
+      createType=*)
+        [[ "$line" == 'createType="vmfs"' ]] ||
+          die "$desc: unsupported $line, only createType=\"vmfs\" is supported"
+        vmfs=1
+        ;;
+      parentFileNameHint=*)
+        die "$desc has a parentFileNameHint, the disk has snapshots"
+        ;;
+      RW\ * | RDONLY\ * | NOACCESS\ *)
+        extents=$((extents + 1))
+        if [[ "$line" =~ ^(RW|RDONLY)\ [0-9]+\ VMFS\ \"(.+)\"$ ]]; then
+          flat=${BASH_REMATCH[2]}
+        else
+          die "$desc: unsupported extent line: $line"
+        fi
+        ;;
+    esac
+  done < "$desc"
+  ((vmfs)) || die "$desc: no createType line, not a vmdk descriptor"
+  ((extents == 1)) || die "$desc has $extents extents, expected exactly one"
+  [[ "$flat" != */* ]] || die "$desc: extent '$flat' is not inside the VM folder"
+  printf '%s' "$dir/$flat"
+}
+
+# check_raw <flat>: flat must exist and qemu-img must report raw.
+check_raw() {
+  local flat=$1 json
+  [[ -f "$flat" && ! -L "$flat" ]] || die "flat file not found: $flat"
+  json=$(qemu-img info --output=json "$flat") || die "qemu-img info failed for $flat"
+  [[ "$json" =~ \"format\":[[:space:]]*\"raw\" ]] || die "$flat is not detected as raw by qemu-img"
+}
+
+# resolve_disks <vm dir>: fill DISK_* arrays, abort on any problem.
+resolve_disks() {
+  local dir=$1 dev file base desc flat i f
+  local -a devs
+  DISK_DEVS=()
+  DISK_DESCS=()
+  DISK_SOURCES=()
+  DISK_SLOTS=()
+  mapfile -t devs < <(vmx_disk_devs)
+  ((${#devs[@]})) || die "no disks found in .vmx"
+  for dev in "${devs[@]}"; do
+    file=$(vmx_get "$dev.fileName")
+    base=${file##*/}
+    [[ "$base" =~ -[0-9]{6}\.vmdk$ ]] &&
+      die "$dev uses $base, the VM has an active snapshot. Consolidate snapshots first"
+    desc="$dir/$base"
+    [[ -f "$desc" ]] || die "$dev: $file is not in the VM folder $dir (disk not on the share)"
+    flat=$(descriptor_flat "$desc" "$dir") || exit
+    check_raw "$flat"
+    for f in "${DISK_SOURCES[@]}"; do
+      [[ "$f" != "$flat" ]] || die "$flat is referenced by more than one disk"
+    done
+    i=${#DISK_DEVS[@]}
+    DISK_DEVS+=("$dev")
+    DISK_DESCS+=("$desc")
+    DISK_SOURCES+=("$flat")
+    DISK_SLOTS+=("${VM_DISK_BUS:-$DISK_BUS}$i")
+  done
+}
+
+valid_bus() {
+  [[ "$1" =~ ^(scsi|sata|virtio)$ ]]
+}
+
+# bus_max_disks <bus>: number of disk slots PVE offers on the bus.
+bus_max_disks() {
+  case "$1" in
+    scsi) echo 31 ;;
+    virtio) echo 16 ;;
+    sata) echo 6 ;;
+  esac
+}
+
+# disk_opts <bus>: DISK_OPTS without options the bus does not support
+# (sata has no iothread, VirtIO Block has no ssd).
+disk_opts() {
+  local bus=$1 opt out=""
+  local -a opts
+  IFS=, read -r -a opts <<< "$DISK_OPTS"
+  for opt in "${opts[@]}"; do
+    case "$bus:${opt%%=*}" in
+      sata:iothread | virtio:ssd) continue ;;
+    esac
+    out+="${out:+,}$opt"
+  done
+  printf '%s' "$out"
+}
+
+# check_vmsd <vm dir>: abort when a .vmsd reports existing snapshots.
+check_vmsd() {
+  local dir=$1 vmsd line
+  for vmsd in "$dir"/*.vmsd; do
+    while IFS= read -r line || [[ -n "$line" ]]; do
+      kv_split "$line" || continue
+      [[ "$KV_KEY" == "snapshot.numsnapshots" ]] || continue
+      [[ "$KV_VALUE" =~ ^[0-9]+$ ]] || die "$vmsd: invalid snapshot.numSnapshots '$KV_VALUE'"
+      ((10#$KV_VALUE == 0)) ||
+        die "$vmsd reports $KV_VALUE snapshot(s). Delete or consolidate snapshots first"
+    done < "$vmsd"
+  done
+}
+
+# vm_disk_checks <vm dir>: every snapshot and disk check, fills DISK_*.
+# VMX must be loaded.
+vm_disk_checks() {
+  check_vmsd "$1"
+  resolve_disks "$1"
+}
+
+# orphan_snapshots <vm dir>: print -00000N.vmdk files in the folder that no
+# fileName in the loaded .vmx references.
+orphan_snapshots() {
+  local dir=$1 key f
+  local -A referenced=()
+  for key in "${!VMX[@]}"; do
+    if [[ "$key" == *.filename ]]; then
+      referenced[${VMX[$key]##*/}]=1
+    fi
+  done
+  for f in "$dir"/*.vmdk; do
+    f=${f##*/}
+    if [[ "$f" =~ -[0-9]{6}\.vmdk$ && -z "${referenced[$f]-}" ]]; then
+      printf '%s\n' "$f"
+    fi
+  done
+}
+
+# ---------------------------------------------------------------------------
+# Lock detection
+# ---------------------------------------------------------------------------
+
+# vm_locked <vm dir>: ESXi holds the VM when NFS v3 lock files or a swap
+# file exist.
+vm_locked() {
+  local dir=$1
+  compgen -G "$dir/.lck-*" > /dev/null || compgen -G "$dir/*.vswp" > /dev/null
+}
+
+# ---------------------------------------------------------------------------
+# State
+# ---------------------------------------------------------------------------
+
+state_file() { printf '%s/%s.state' "$STATE_DIR" "$1"; }
+log_file() { printf '%s/%s.log' "$STATE_DIR" "$1"; }
+rollback_file() { printf '%s/%s.rollback' "$STATE_DIR" "$1"; }
+
+archive_stamp() { date '+%Y%m%d-%H%M%S'; }
+
+# archive_file <file> <stamp>: rename <file> to <file>.<stamp> if it exists,
+# never overwriting. Prints the archive path.
+archive_file() {
+  local file=$1 dst="$1.$2"
+  [[ -e "$file" ]] || return 0
+  [[ ! -e "$dst" && ! -L "$dst" ]] || die "cannot archive $file, $dst already exists"
+  run mv -n -- "$file" "$dst" >&2
+  if ((!DRY_RUN)) && [[ -e "$file" || ! -e "$dst" ]]; then
+    die "archiving $file to $dst failed"
+  fi
+  printf '%s' "$dst"
+}
+
+state_reset() {
+  VMID=""
+  NODE=""
+  STATUS=""
+  PREPARED_AT=""
+  MIGRATED_AT=""
+  DISK_SOURCES=()
+  DISK_TARGETS=()
+  DISK_SLOTS=()
+  VM_DISK_BUS=""
+  SET_OPTS=()
+}
+
+# The state file lives on a share other hosts can write to, so it is never
+# sourced. state_parse_text accepts exactly what state_save writes:
+#   declare -g KEY="value"                      for STATE_SCALARS
+#   declare -ga KEY=([0]="value" [1]="value")   for STATE_ARRAYS
+# every key exactly once, nothing else.
+readonly -a STATE_SCALARS=(VMID NODE STATUS PREPARED_AT MIGRATED_AT VM_DISK_BUS)
+readonly -a STATE_ARRAYS=(DISK_SOURCES DISK_TARGETS DISK_SLOTS SET_OPTS)
+DQ_VALUE=""
+DQ_REST=""
+
+# dq_scan <text>: read a double-quoted string as declare -p writes it, from
+# just after the opening quote. Sets DQ_VALUE and DQ_REST (the text after
+# the closing quote). Only the escapes \" \$ \` \\ are allowed; an unescaped
+# $ or backtick, any other escape or a control character fails.
+dq_scan() {
+  local text=$1 out="" c n i=0 len=${#1}
+  while ((i < len)); do
+    c=${text:i:1}
+    case "$c" in
+      \\)
+        n=${text:i+1:1}
+        case "$n" in
+          '"' | '$' | '`' | \\) out+=$n ;;
+          *) return 1 ;;
+        esac
+        i=$((i + 2))
+        ;;
+      '"')
+        DQ_VALUE=$out
+        DQ_REST=${text:i+1}
+        return 0
+        ;;
+      '$' | '`' | [[:cntrl:]]) return 1 ;;
+      *)
+        out+=$c
+        i=$((i + 1))
+        ;;
+    esac
+  done
+  return 1
+}
+
+# state_parse_text <content> <label>: parse and validate state content into
+# the state variables, abort with <label> in the message on any deviation.
+state_parse_text() {
+  local content=$1 label=$2 line key body n f
+  local -A seen=()
+  local -a values
+  state_reset
+  [[ -n "$content" ]] || die "$label: invalid state file: empty"
+  [[ "$content" != *$'\r'* ]] || die "$label: invalid state file: carriage return"
+  while IFS= read -r line; do
+    if [[ "$line" =~ ^declare\ -g\ ([A-Z_]+)=\"(.*)$ ]]; then
+      key=${BASH_REMATCH[1]}
+      [[ " ${STATE_SCALARS[*]} " == *" $key "* ]] || die "$label: invalid state file: unknown key '$key'"
+      if ! dq_scan "${BASH_REMATCH[2]}" || [[ -n "$DQ_REST" ]]; then
+        die "$label: invalid state file: bad value for $key"
+      fi
+      printf -v "$key" '%s' "$DQ_VALUE"
+    elif [[ "$line" =~ ^declare\ -ga\ ([A-Z_]+)=\((.*)\)$ ]]; then
+      key=${BASH_REMATCH[1]}
+      [[ " ${STATE_ARRAYS[*]} " == *" $key "* ]] || die "$label: invalid state file: unknown key '$key'"
+      body=${BASH_REMATCH[2]}
+      values=()
+      n=0
+      while [[ -n "$body" ]]; do
+        if ((n > 0)); then
+          [[ "$body" == " "* ]] || die "$label: invalid state file: bad array $key"
+          body=${body# }
+        fi
+        [[ "$body" == "[$n]=\""* ]] || die "$label: invalid state file: bad array $key"
+        body=${body#"[$n]=\""}
+        dq_scan "$body" || die "$label: invalid state file: bad value in $key"
+        values+=("$DQ_VALUE")
+        body=$DQ_REST
+        n=$((n + 1))
+      done
+      case "$key" in
+        DISK_SOURCES) DISK_SOURCES=("${values[@]}") ;;
+        DISK_TARGETS) DISK_TARGETS=("${values[@]}") ;;
+        DISK_SLOTS) DISK_SLOTS=("${values[@]}") ;;
+        SET_OPTS) SET_OPTS=("${values[@]}") ;;
+      esac
+    else
+      die "$label: invalid state file: unexpected line '${line:0:60}'"
+    fi
+    [[ -z "${seen[$key]-}" ]] || die "$label: invalid state file: duplicate key $key"
+    seen[$key]=1
+  done <<< "${content%$'\n'}"
+  for key in "${STATE_SCALARS[@]}" "${STATE_ARRAYS[@]}"; do
+    [[ -n "${seen[$key]-}" ]] || die "$label: invalid state file: missing key $key"
+  done
+
+  [[ "$VMID" =~ ^[1-9][0-9]*$ ]] || die "$label: invalid VMID '$VMID'"
+  [[ "$NODE" =~ ^[A-Za-z0-9][A-Za-z0-9.-]*$ ]] || die "$label: invalid NODE '$NODE'"
+  [[ "$STATUS" =~ ^(prepared|migrated)$ ]] || die "$label: invalid STATUS '$STATUS'"
+  [[ "$PREPARED_AT" =~ ^[0-9T:+-]+$ ]] || die "$label: invalid PREPARED_AT '$PREPARED_AT'"
+  [[ -z "$MIGRATED_AT" || "$MIGRATED_AT" =~ ^[0-9T:+-]+$ ]] || die "$label: invalid MIGRATED_AT '$MIGRATED_AT'"
+  valid_bus "$VM_DISK_BUS" || die "$label: invalid VM_DISK_BUS '$VM_DISK_BUS'"
+  ((${#DISK_SOURCES[@]} > 0 &&
+    ${#DISK_SOURCES[@]} == ${#DISK_TARGETS[@]} &&
+    ${#DISK_SOURCES[@]} == ${#DISK_SLOTS[@]})) || die "$label: inconsistent disk arrays"
+  for n in "${!DISK_SOURCES[@]}"; do
+    f=${DISK_SOURCES[n]}
+    [[ "$f" == "$NFS_PATH"/*/* && "/$f/" != */../* && "/$f/" != */./* ]] ||
+      die "$label: disk source '$f' is not below $NFS_PATH"
+    [[ "${DISK_TARGETS[n]}" =~ ^vm-$VMID-disk-[0-9]+\.raw$ ]] ||
+      die "$label: invalid disk target '${DISK_TARGETS[n]}'"
+    [[ "${DISK_SLOTS[n]}" == "$VM_DISK_BUS$n" ]] ||
+      die "$label: invalid disk slot '${DISK_SLOTS[n]}'"
+  done
+  for f in "${SET_OPTS[@]}"; do
+    if key=$(opt_invalid "$f"); then
+      die "$label: invalid SET_OPTS entry: $key"
+    fi
+  done
+}
+
+# state_load <vm>: read and strictly parse the state file, never source it.
+state_load() {
+  local file content=""
+  file=$(state_file "$1")
+  state_reset
+  [[ -f "$file" ]] || die "no state file for $1 ($file), run prepare first"
+  [[ "$(tr -d '\000' < "$file" | wc -c)" -eq "$(wc -c < "$file")" ]] || die "$file: invalid state file: NUL byte"
+  IFS= read -r -d '' content < "$file" || true
+  state_parse_text "$content" "$file"
+}
+
+# state_decl <var>...: declare -p output in the syntax state_parse_text reads.
+state_decl() {
+  local var decl
+  for var in "$@"; do
+    decl=$(declare -p "$var")
+    decl=${decl/#declare -- /declare -g }
+    decl=${decl/#declare -a /declare -ga }
+    printf '%s\n' "$decl"
+  done
+}
+
+state_save() {
+  local content value
+  # declare -p switches to $'...' quoting for control characters, which the
+  # parser does not accept
+  for value in "$VMID" "$NODE" "$STATUS" "$PREPARED_AT" "$MIGRATED_AT" "$VM_DISK_BUS" \
+    "${DISK_SOURCES[@]}" "${DISK_TARGETS[@]}" "${DISK_SLOTS[@]}" "${SET_OPTS[@]}"; do
+    [[ "$value" != *[[:cntrl:]]* ]] || die "control character in state value '$value'"
+  done
+  content=$(state_decl "${STATE_SCALARS[@]}" "${STATE_ARRAYS[@]}")$'\n'
+  (state_parse_text "$content" "generated state") > /dev/null ||
+    die "internal error: generated state for $1 does not pass the parser"
+  run write_atomic "$(state_file "$1")" "$content"
+}
+
+# ---------------------------------------------------------------------------
+# Network mapping
+# ---------------------------------------------------------------------------
+
+map_file() { printf '%s/portgroups.map' "$STATE_DIR"; }
+
+# map_parse_line <line>: set MAP_KEY MAP_BRIDGE MAP_TAG MAP_LABEL, return 1
+# for comments and blank lines. Fields are split on runs of tabs, '-' is
+# empty.
+map_parse_line() {
+  local line=${1%$'\r'} key bridge tag label
+  [[ "$line" =~ ^[[:space:]]*(#|$) ]] && return 1
+  IFS=$'\t' read -r key bridge tag label <<< "$line"
+  [[ "$bridge" == "-" ]] && bridge=""
+  [[ "$tag" == "-" ]] && tag=""
+  [[ "$label" == "-" ]] && label=""
+  MAP_KEY=$key
+  MAP_BRIDGE=$bridge
+  MAP_TAG=$tag
+  MAP_LABEL=$label
+}
+
+# map_lookup <key>: set MAP_BRIDGE MAP_TAG MAP_LABEL, return 1 if unknown.
+map_lookup() {
+  local key=$1 file line
+  file=$(map_file)
+  [[ -f "$file" ]] || return 1
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    map_parse_line "$line" || continue
+    [[ "$MAP_KEY" == "$key" ]] && return 0
+  done < "$file"
+  MAP_BRIDGE=""
+  MAP_TAG=""
+  MAP_LABEL=""
+  return 1
+}
+
+# map_write <key> <bridge> <tag> <label>: replace or append the line for key.
+map_write() {
+  local key=$1 file line entry content="" found=0 old=""
+  entry="$key"$'\t'"$2"$'\t'"${3:--}"$'\t'"${4:--}"
+  file=$(map_file)
+  if [[ -f "$file" ]]; then
+    old=$(< "$file")
+    while IFS= read -r line || [[ -n "$line" ]]; do
+      if map_parse_line "$line" && [[ "$MAP_KEY" == "$key" ]]; then
+        ((found)) && continue
+        line=$entry
+        found=1
+      fi
+      content+="$line"$'\n'
+    done < "$file"
+  else
+    content="# key"$'\t'"bridge"$'\t'"tag"$'\t'"label"$'\n'
+  fi
+  ((found)) || content+="$entry"$'\n'
+  [[ "$content" == "$old"$'\n' ]] && return 0
+  run write_atomic "$file" "$content"
+}
+
+load_bridges() {
+  local out num name rest
+  BRIDGES=()
+  out=$(ip -o link show type bridge) || die "ip link show failed"
+  while read -r num name rest; do
+    [[ -n "$num" ]] || continue
+    name=${name%:}
+    BRIDGES+=("${name%@*}")
+  done <<< "$out"
+  ((${#BRIDGES[@]})) || die "no bridges found on this node"
+}
+
+bridge_exists() {
+  local b
+  for b in "${BRIDGES[@]}"; do
+    [[ "$b" == "$1" ]] && return 0
+  done
+  return 1
+}
+
+valid_tag() {
+  [[ "$1" =~ ^[1-9][0-9]{0,3}$ ]] && (($1 <= 4094))
+}
+
+# vmx_nics: fill NIC_IDXS NIC_MACS NIC_KEYS for present NICs, by index.
+vmx_nics() {
+  local key idx mac nkey
+  local -a idxs=()
+  NIC_IDXS=()
+  NIC_MACS=()
+  NIC_KEYS=()
+  for key in "${!VMX[@]}"; do
+    [[ "$key" =~ ^ethernet([0-9]+)\.present$ ]] || continue
+    vmx_true "$key" && idxs+=("${BASH_REMATCH[1]}")
+  done
+  ((${#idxs[@]})) || return 0
+  mapfile -t idxs < <(printf '%s\n' "${idxs[@]}" | sort -n)
+  for idx in "${idxs[@]}"; do
+    if [[ "$(vmx_get "ethernet$idx.addressType")" == [Ss][Tt][Aa][Tt][Ii][Cc] ]]; then
+      mac=$(vmx_get "ethernet$idx.address")
+    else
+      mac=$(vmx_get "ethernet$idx.generatedAddress")
+    fi
+    [[ "$mac" =~ ^([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$ ]] || die "ethernet$idx: invalid or missing MAC '$mac'"
+    nkey=$(vmx_get "ethernet$idx.dvs.portgroupId")
+    [[ -n "$nkey" ]] || nkey=$(vmx_get "ethernet$idx.networkName")
+    [[ "$nkey" != *$'\t'* ]] || die "ethernet$idx: mapping key '$nkey' contains a tab"
+    NIC_IDXS+=("$idx")
+    NIC_MACS+=("$mac")
+    NIC_KEYS+=("$nkey")
+  done
+}
+
+# nic_assign <n>: choose bridge, tag and label for NIC n (array index),
+# write the choice back to the mapping file.
+nic_assign() {
+  local n=$1 idx=${NIC_IDXS[$1]} mac=${NIC_MACS[$1]} key=${NIC_KEYS[$1]}
+  local known=0 bridge tag label answer i
+  if [[ -n "$key" ]] && map_lookup "$key"; then
+    known=1
+  fi
+  bridge=${MAP_BRIDGE:-$DEFAULT_BRIDGE}
+  tag=$MAP_TAG
+  label=$MAP_LABEL
+
+  info ""
+  info "NIC ethernet$idx  MAC $mac  key '${key:-<none>}'$( ((known)) && echo " (from mapping)" || echo " (not in mapping)")"
+
+  if ((ASSUME_YES)); then
+    ((known)) || die "ethernet$idx: key '${key:-<none>}' is not in $(map_file), --yes requires known keys"
+    [[ -z "$tag" ]] || valid_tag "$tag" || die "ethernet$idx: invalid VLAN tag '$tag' in mapping for '$key'"
+  else
+    info "Available bridges:"
+    for i in "${!BRIDGES[@]}"; do
+      info "  $((i + 1))) ${BRIDGES[i]}"
+    done
+    while true; do
+      answer=$(ask "Bridge [$bridge]: ") || exit
+      answer=${answer:-$bridge}
+      if [[ "$answer" =~ ^[0-9]+$ ]] && ((answer >= 1 && answer <= ${#BRIDGES[@]})); then
+        answer=${BRIDGES[answer - 1]}
+      fi
+      if bridge_exists "$answer"; then
+        bridge=$answer
+        break
+      fi
+      warn "bridge '$answer' does not exist"
+    done
+    while true; do
+      answer=$(ask "VLAN tag [${tag:--}] ('-' for none): ") || exit
+      answer=${answer:-${tag:--}}
+      if [[ "$answer" == "-" ]]; then
+        tag=""
+        break
+      fi
+      if valid_tag "$answer"; then
+        tag=$answer
+        break
+      fi
+      warn "invalid VLAN tag '$answer', expected 1-4094 or '-'"
+    done
+    while true; do
+      answer=$(ask "Label [${label:--}] ('-' for none): ") || exit
+      answer=${answer:-${label:--}}
+      if [[ "$answer" != *$'\t'* ]]; then
+        break
+      fi
+      warn "label must not contain tabs"
+    done
+    [[ "$answer" == "-" ]] && label="" || label=$answer
+  fi
+
+  bridge_exists "$bridge" || die "ethernet$idx: bridge '$bridge' does not exist on this node"
+  NIC_BRIDGES[n]=$bridge
+  NIC_TAGS[n]=$tag
+  NIC_LABELS[n]=$label
+  if [[ -n "$key" ]]; then
+    map_write "$key" "$bridge" "$tag" "$label"
+  fi
+}
+
+nic_arg() {
+  local n=$1 arg
+  arg="$NIC_MODEL=${NIC_MACS[n]},bridge=${NIC_BRIDGES[n]}"
+  [[ -z "${NIC_TAGS[n]}" ]] || arg+=",tag=${NIC_TAGS[n]}"
+  printf '%s' "$arg"
+}
+
+# ---------------------------------------------------------------------------
+# Shared preflight
+# ---------------------------------------------------------------------------
+
+storage_exists() {
+  local out
+  out=$(pvesm status) || die "pvesm status failed"
+  awk -v s="$1" 'NR > 1 && $1 == s { found = 1 } END { exit !found }' <<< "$out"
+}
+
+preflight_node() {
+  [[ "$(id -u)" == "0" ]] || die "must run as root"
+  mountpoint -q "$NFS_PATH" || die "$NFS_PATH is not a mountpoint"
+  storage_exists "$NFS_STORE" || die "storage '$NFS_STORE' not found in pvesm status"
+}
+
+# vm_dir <vm>: print the VM folder, abort if invalid.
+vm_dir() {
+  local vm=$1 dir
+  [[ -n "$vm" && "$vm" != */* && "$vm" != "." && "$vm" != ".." && "$vm" != "images" ]] ||
+    die "invalid VM folder name '$vm'"
+  dir="$NFS_PATH/$vm"
+  [[ -d "$dir" ]] || die "VM folder $dir not found"
+  [[ ! "$dir" -ef "$STATE_DIR" ]] || die "invalid VM folder name '$vm'"
+  printf '%s' "$dir"
+}
+
+# ---------------------------------------------------------------------------
+# prepare
+# ---------------------------------------------------------------------------
+
+# compute_targets: next free disk indices on NFS_STORE after qm create
+# (an efidisk0 may already use one).
+compute_targets() {
+  local out volid rest f i=0 n
+  local -A used=()
+  out=$(pvesm list "$NFS_STORE" --vmid "$VMID") || die "pvesm list $NFS_STORE failed"
+  while read -r volid rest; do
+    if [[ "$volid" =~ /vm-$VMID-disk-([0-9]+)\.[a-z0-9]+$ ]]; then
+      used[${BASH_REMATCH[1]}]=1
+    fi
+  done <<< "$out"
+  for f in "$NFS_PATH/images/$VMID/vm-$VMID-disk-"*; do
+    if [[ "${f##*/}" =~ ^vm-$VMID-disk-([0-9]+)\. ]]; then
+      used[${BASH_REMATCH[1]}]=1
+    fi
+  done
+  DISK_TARGETS=()
+  for n in "${!DISK_SOURCES[@]}"; do
+    while [[ -n "${used[$i]-}" ]]; do
+      i=$((i + 1))
+    done
+    DISK_TARGETS+=("vm-$VMID-disk-$i.raw")
+    used[$i]=1
+  done
+}
+
+# opt_invalid <key=value>: print why an option is not acceptable and
+# return 0, return 1 when it is fine.
+opt_invalid() {
+  local kv=$1 key
+  if [[ "$kv" != *=* ]]; then
+    printf "'%s' is not key=value" "$kv"
+    return 0
+  fi
+  key=${kv%%=*}
+  if [[ ! "$key" =~ ^[a-z][a-z0-9_-]*$ ]]; then
+    printf "invalid option key '%s'" "$key"
+  elif [[ "$key" =~ $RESERVED_OPT_RE ]]; then
+    printf "option '%s' is reserved, disks, boot order, firmware (bios), efidisk0 and vmid are managed by vmxodus" "$key"
+  elif [[ -z "${kv#*=}" ]]; then
+    printf "empty value for option '%s'" "$key"
+  else
+    return 1
+  fi
+}
+
+# opt_put <key> <value> <source>: set an option, keeping its position.
+opt_put() {
+  [[ -n "${OPT_VALUES[$1]+set}" ]] || OPT_KEYS+=("$1")
+  OPT_VALUES[$1]=$2
+  OPT_SOURCES[$1]=$3
+}
+
+# build_create_opts: merge the qm create options. Precedence, low to high:
+# built-in defaults < config (incl. EXTRA_OPTS) < .vmx < SET_OPTS.
+build_create_opts() {
+  local kv key n
+  local -A derived=()
+  OPT_KEYS=()
+  OPT_VALUES=()
+  OPT_SOURCES=()
+  opt_put name "$CFG_NAME" vmx
+  opt_put cores "$CFG_CORES" vmx
+  opt_put sockets "$CFG_SOCKETS" vmx
+  opt_put numa "$NUMA" config
+  opt_put memory "$CFG_MEMORY" vmx
+  opt_put cpu "$CPU_TYPE" config
+  opt_put ostype "$CFG_OSTYPE" vmx
+  opt_put bios "$CFG_BIOS" vmx
+  if ((CFG_EFI)); then
+    opt_put machine q35 vmx
+  fi
+  opt_put scsihw "$SCSIHW" config
+  opt_put agent "$AGENT" config
+  opt_put hotplug "$HOTPLUG" config
+  opt_put "$CDROM_SLOT" "none,media=cdrom" config
+  if ((CFG_EFI)); then
+    opt_put efidisk0 "$EFI_STORE:1,efitype=4m,pre-enrolled-keys=$CFG_SECUREBOOT" vmx
+  fi
+  for n in "${!NIC_IDXS[@]}"; do
+    opt_put "net${NIC_IDXS[n]}" "$(nic_arg "$n")" vmx
+  done
+  for key in "${OPT_KEYS[@]}"; do
+    if [[ "${OPT_SOURCES[$key]}" == "vmx" ]]; then
+      derived[$key]=1
+    fi
+  done
+  for kv in "${EXTRA_OPTS[@]}"; do
+    key=${kv%%=*}
+    [[ -z "${derived[$key]-}" ]] || continue
+    opt_put "$key" "${kv#*=}" EXTRA_OPTS
+  done
+  for kv in "${SET_OPTS[@]}"; do
+    opt_put "${kv%%=*}" "${kv#*=}" set
+  done
+}
+
+print_options() {
+  local key
+  local -a rows=($'  option\tvalue\tsource')
+  for key in "${OPT_KEYS[@]}"; do
+    rows+=("  --$key"$'\t'"${OPT_VALUES[$key]}"$'\t'"${OPT_SOURCES[$key]}")
+  done
+  printf '\n  qm create %s options\n' "$VMID"
+  print_table "${rows[@]}"
+}
+
+print_summary() {
+  local vm=$1 n
+  local -a rows
+  printf '\nSummary for %s (VMID %s)\n' "$vm" "$VMID"
+  print_options
+  [[ -z "$CFG_OSTYPE_WARNING" ]] || printf '  WARNING: %s\n' "$CFG_OSTYPE_WARNING"
+  printf '\n  Disks on bus %s%s\n' "$VM_DISK_BUS" "$( ((CFG_EFI)) && echo " (target names are final after qm create)")"
+  rows=($'  slot\tsource flat\ttarget')
+  for n in "${!DISK_SOURCES[@]}"; do
+    rows+=("  ${DISK_SLOTS[n]}"$'\t'"${DISK_SOURCES[n]##*/}"$'\t'"${DISK_TARGETS[n]}")
+  done
+  print_table "${rows[@]}"
+  printf '\n  NICs\n'
+  rows=($'  net\tMAC\tbridge\ttag\tlabel')
+  for n in "${!NIC_IDXS[@]}"; do
+    rows+=("  net${NIC_IDXS[n]}"$'\t'"${NIC_MACS[n]}"$'\t'"${NIC_BRIDGES[n]}"$'\t'"${NIC_TAGS[n]:--}"$'\t'"${NIC_LABELS[n]:--}")
+  done
+  ((${#NIC_IDXS[@]})) && print_table "${rows[@]}" || printf '  none\n'
+  printf '\n'
+}
+
+# prompt_extra_opts: ask for additional key=value options until the input
+# is empty, show the merged options after each accepted line.
+prompt_extra_opts() {
+  local line kv msg ok
+  local -a kvs
+  while true; do
+    line=$(ask "Additional options (key=value, space separated, empty to continue): ") || exit
+    read -r -a kvs <<< "$line"
+    ((${#kvs[@]})) || return 0
+    ok=1
+    for kv in "${kvs[@]}"; do
+      if msg=$(opt_invalid "$kv"); then
+        warn "$msg"
+        ok=0
+      fi
+    done
+    ((ok)) || continue
+    SET_OPTS+=("${kvs[@]}")
+    build_create_opts
+    print_options
+  done
+}
+
+cmd_prepare() {
+  local vm="" opt_vmid="" opt_bus="" arg dir file n images kv msg key max archived i=0
+  local -a vmxs create_args orphans args=("$@")
+  while ((i < ${#args[@]})); do
+    arg=${args[i]}
+    i=$((i + 1))
+    case "$arg" in
+      --vmid=*) opt_vmid=${arg#*=} ;;
+      --disk-bus=*)
+        opt_bus=${arg#*=}
+        valid_bus "$opt_bus" || usage_error "invalid --disk-bus '$opt_bus', expected scsi, sata or virtio"
+        ;;
+      --set)
+        ((i < ${#args[@]})) || usage_error "--set needs key=value"
+        kv=${args[i]}
+        i=$((i + 1))
+        if msg=$(opt_invalid "$kv"); then
+          usage_error "--set: $msg"
+        fi
+        SET_OPTS+=("$kv")
+        ;;
+      --yes) ASSUME_YES=1 ;;
+      --dry-run) DRY_RUN=1 ;;
+      -*) usage_error "unknown option '$arg'" ;;
+      *)
+        [[ -z "$vm" ]] || usage_error "unexpected argument '$arg'"
+        vm=$arg
+        ;;
+    esac
+  done
+  [[ -n "$vm" ]] || usage_error "missing <vm>"
+  [[ -z "$opt_vmid" || "$opt_vmid" =~ ^[1-9][0-9]*$ ]] || usage_error "invalid --vmid '$opt_vmid'"
+
+  install_traps
+  preflight_node
+  dir=$(vm_dir "$vm") || exit
+  if [[ ! -d "$STATE_DIR" ]]; then
+    run mkdir -p "$STATE_DIR"
+  fi
+  start_log "$vm" prepare "$@"
+
+  vmxs=("$dir"/*.vmx)
+  ((${#vmxs[@]} == 1)) || die "expected exactly one .vmx in $dir, found ${#vmxs[@]}"
+  file=$(state_file "$vm")
+  if [[ -f "$file" ]]; then
+    state_load "$vm"
+    die "state file $file exists (VMID $VMID, status $STATUS), $vm was already prepared"
+  fi
+  if vm_locked "$dir"; then
+    warn "$vm is still running in VMware (lock files present), fine for prepare"
+  fi
+
+  VM_DISK_BUS=${opt_bus:-$DISK_BUS}
+  valid_bus "$VM_DISK_BUS" || die "invalid DISK_BUS '$VM_DISK_BUS' in $VMXODUS_CONF, expected scsi, sata or virtio"
+  [[ "${CDROM_SLOT%%[0-9]*}" != "$VM_DISK_BUS" ]] ||
+    die "CDROM_SLOT $CDROM_SLOT is on the disk bus $VM_DISK_BUS, use another CDROM_SLOT or disk bus"
+  for kv in "${EXTRA_OPTS[@]}"; do
+    if msg=$(opt_invalid "$kv"); then
+      die "EXTRA_OPTS in $VMXODUS_CONF: $msg"
+    fi
+  done
+
+  vmx_load "${vmxs[0]}"
+  derive_config
+  [[ -z "$CFG_OSTYPE_WARNING" ]] || warn "$CFG_OSTYPE_WARNING"
+  if ((CFG_EFI)) && [[ "$EFI_STORE" != "$NFS_STORE" ]]; then
+    storage_exists "$EFI_STORE" || die "EFI storage '$EFI_STORE' not found in pvesm status"
+  fi
+  vm_disk_checks "$dir"
+  max=$(bus_max_disks "$VM_DISK_BUS")
+  ((${#DISK_SOURCES[@]} <= max)) ||
+    die "$vm has ${#DISK_SOURCES[@]} disks, bus $VM_DISK_BUS supports at most $max"
+  mapfile -t orphans < <(orphan_snapshots "$dir")
+  if ((${#orphans[@]})); then
+    warn "orphaned snapshot files not referenced by the .vmx: ${orphans[*]} (they are not migrated)"
+  fi
+  vmx_nics
+
+  if [[ -n "$opt_vmid" ]]; then
+    VMID=$opt_vmid
+  else
+    VMID=$(pvesh get /cluster/nextid) || die "pvesh get /cluster/nextid failed"
+  fi
+  pvesh get /cluster/nextid --vmid "$VMID" > /dev/null 2>&1 || die "VMID $VMID is already in use"
+  images="$NFS_PATH/images/$VMID"
+  if [[ -e "$images" ]]; then
+    [[ -d "$images" ]] || die "$images exists and is not a directory"
+    [[ -z "$(find "$images" -mindepth 1 -maxdepth 1 -print -quit)" ]] || die "$images is not empty"
+  fi
+
+  if ((${#NIC_IDXS[@]})); then
+    load_bridges
+    for n in "${!NIC_IDXS[@]}"; do
+      nic_assign "$n"
+    done
+  fi
+
+  for kv in "${EXTRA_OPTS[@]}"; do
+    key=${kv%%=*}
+    case "$key" in
+      name | cores | sockets | memory | ostype | net[0-9]*)
+        warn "EXTRA_OPTS $kv is overridden by the value derived from the .vmx"
+        ;;
+      machine)
+        ((!CFG_EFI)) || warn "EXTRA_OPTS $kv is overridden by the value derived from the .vmx"
+        ;;
+    esac
+  done
+  build_create_opts
+  compute_targets
+  print_summary "$vm"
+  if ((!ASSUME_YES)); then
+    prompt_extra_opts
+  fi
+  if ((!ASSUME_YES && !DRY_RUN)); then
+    confirm "Create VM $VMID?" || die "aborted"
+  fi
+
+  create_args=(qm create "$VMID")
+  for key in "${OPT_KEYS[@]}"; do
+    create_args+=("--$key" "${OPT_VALUES[$key]}")
+  done
+
+  run "${create_args[@]}"
+  run mkdir -p "$images"
+  if ((CFG_EFI)); then
+    compute_targets
+    ((DRY_RUN)) && info "note: in a real run the efidisk0 may shift the target indices"
+  fi
+
+  archived=$(archive_file "$(rollback_file "$vm")" "$(archive_stamp)") || exit
+  [[ -z "$archived" ]] || info "archived the previous rollback file to $archived"
+
+  NODE=$THIS_NODE
+  STATUS="prepared"
+  # shellcheck disable=SC2034 # persisted by name via state_decl
+  PREPARED_AT=$(date '+%Y-%m-%dT%H:%M:%S%z')
+  MIGRATED_AT=""
+  state_save "$vm"
+
+  if ((DRY_RUN)); then
+    printf '\nDry run, nothing was changed. %s would be prepared as VMID %s on node %s.\n' "$vm" "$VMID" "$NODE"
+  else
+    printf '\n%s prepared as VMID %s on node %s.\n' "$vm" "$VMID" "$NODE"
+  fi
+  for n in "${!DISK_SOURCES[@]}"; do
+    printf '  %s -> %s (%s)\n' "${DISK_SOURCES[n]##*/}" "${DISK_TARGETS[n]}" "${DISK_SLOTS[n]}"
+  done
+  printf 'Shut the VM down in vCenter, then run on %s: vmxodus cutover %s\n' "$NODE" "$vm"
+}
+
+# ---------------------------------------------------------------------------
+# cutover
+# ---------------------------------------------------------------------------
+
+# wait_unlocked <vm dir> <timeout>: poll until the locks are gone.
+wait_unlocked() {
+  local dir=$1 timeout=$2 waited=0
+  info "Waiting up to ${timeout}s for the VMware locks in $dir to disappear"
+  while vm_locked "$dir"; do
+    ((waited < timeout)) || return 1
+    sleep "$WAIT_INTERVAL"
+    waited=$((waited + WAIT_INTERVAL))
+  done
+  info "Locks are gone after ${waited}s"
+}
+
+# recheck_disks <vm dir>: re-parse the .vmx and all descriptors, apply every
+# snapshot and disk check again and require the same disk list as in the
+# state file (source flats and order).
+recheck_disks() {
+  local dir=$1 expected found
+  local -a vmxs=("$dir"/*.vmx)
+  expected=$(printf '%s\n' "${DISK_SOURCES[@]}")
+  ((${#vmxs[@]} == 1)) || die "expected exactly one .vmx in $dir, found ${#vmxs[@]}"
+  vmx_load "${vmxs[0]}"
+  vm_disk_checks "$dir"
+  found=$(printf '%s\n' "${DISK_SOURCES[@]}")
+  if [[ "$found" != "$expected" ]]; then
+    die "disks changed since prepare, refusing to cut over
+  state file: ${expected//$'\n'/ }
+  .vmx now:   ${found//$'\n'/ }"
+  fi
+}
+
+# validate_cutover <vm dir> <images dir>: everything that can fail before
+# the first mv.
+validate_cutover() {
+  local dir=$1 images=$2 n src dst src_dev dst_dev
+  [[ -d "$images" ]] || die "$images does not exist"
+  # mv must be a rename inside one filesystem, never a copy across devices
+  src_dev=$(stat -c %d "$dir")
+  dst_dev=$(stat -c %d "$images")
+  [[ "$src_dev" == "$dst_dev" ]] ||
+    die "$dir (device $src_dev) and $images (device $dst_dev) are not on the same filesystem, refusing to move"
+  for n in "${!DISK_SOURCES[@]}"; do
+    src=${DISK_SOURCES[n]}
+    dst="$images/${DISK_TARGETS[n]}"
+    [[ "${src%/*}" == "$dir" ]] || die "$src is not inside $dir"
+    [[ "${DISK_TARGETS[n]}" =~ ^vm-$VMID-disk-[0-9]+\.raw$ ]] || die "invalid target name '${DISK_TARGETS[n]}'"
+    [[ "${DISK_SLOTS[n]}" =~ ^${VM_DISK_BUS}[0-9]+$ ]] || die "invalid slot '${DISK_SLOTS[n]}' for bus $VM_DISK_BUS"
+    [[ ! -e "$dst" && ! -L "$dst" ]] || die "target $dst already exists"
+  done
+}
+
+# verify_moved <src> <dst> <expected size> <rollback file> <mv exit code>:
+# check the result of mv on the file system instead of trusting its exit
+# code (mv -n reports a skipped move differently across coreutils versions).
+# Appends the reverse mv as soon as the file is known to be at the target.
+verify_moved() {
+  local src=$1 dst=$2 size=$3 rollback=$4 rc=$5 actual undo="Undo completed moves with: bash $4"
+  if [[ -e "$src" || -L "$src" ]]; then
+    CUTOVER_PENDING=()
+    die "source $src still exists after mv (exit code $rc). $undo"
+  fi
+  if [[ ! -f "$dst" || -L "$dst" ]]; then
+    die "target $dst is missing after mv (exit code $rc) and the source is gone, check manually. $undo"
+  fi
+  run append_line "$rollback" "$(quote_cmd mv -n -- "$dst" "$src")"
+  CUTOVER_PENDING=()
+  CUTOVER_MOVED=$((CUTOVER_MOVED + 1))
+  actual=$(stat -c %s "$dst")
+  [[ "$actual" == "$size" ]] ||
+    die "target $dst has $actual bytes, expected $size (exit code $rc). $undo"
+  ((rc == 0)) || warn "mv exited with $rc, but $dst is in place with the expected size"
+}
+
+# cutover_report <exit code>: on any abnormal exit, say where cutover
+# stopped and what to do with the rollback file.
+cutover_report() {
+  local rc=$1 total=${#DISK_SOURCES[@]}
+  ((rc != 0)) || return 0
+  report "ERROR: cutover of ${CUTOVER_VM:-<unknown>} aborted (exit code $rc${CAUGHT_SIGNAL:+, signal $CAUGHT_SIGNAL})"
+  report "  last step: ${CUTOVER_STEP:-start}"
+  [[ -z "$ERR_INFO" ]] || report "  failed command: $ERR_INFO"
+  if ((!DRY_RUN && ${#CUTOVER_PENDING[@]})); then
+    report "  the mv of the last step may have happened without being recorded in the rollback file."
+    report "  If ${CUTOVER_PENDING[1]} exists and ${CUTOVER_PENDING[0]} does not, undo it with: $(quote_cmd mv -n -- "${CUTOVER_PENDING[1]}" "${CUTOVER_PENDING[0]}")"
+  fi
+  if ((DRY_RUN)); then
+    report "  dry run, nothing was changed"
+  elif ((CUTOVER_ATTACHED)); then
+    report "  all flat files are moved and attached to VM $VMID. Do not run the rollback file $CUTOVER_ROLLBACK unless the disks are detached first"
+  elif ((CUTOVER_MOVED)); then
+    report "  $CUTOVER_MOVED of $total flat file(s) already moved. Undo with: bash $CUTOVER_ROLLBACK"
+  else
+    report "  no flat file was moved, nothing to undo (rollback file: ${CUTOVER_ROLLBACK:-none})"
+  fi
+}
+
+cmd_cutover() {
+  local vm="" start=0 wait=0 timeout=$WAIT_DEFAULT_TIMEOUT arg dir images rollback n src dst boot size rc vol opts archived
+  local -a set_args
+  for arg in "$@"; do
+    case "$arg" in
+      --start) start=1 ;;
+      --wait) wait=1 ;;
+      --wait=*)
+        wait=1
+        timeout=${arg#*=}
+        [[ "$timeout" =~ ^[0-9]+$ ]] || usage_error "invalid --wait '$timeout'"
+        ;;
+      --yes) ASSUME_YES=1 ;;
+      --dry-run) DRY_RUN=1 ;;
+      -*) usage_error "unknown option '$arg'" ;;
+      *)
+        [[ -z "$vm" ]] || usage_error "unexpected argument '$arg'"
+        vm=$arg
+        ;;
+    esac
+  done
+  [[ -n "$vm" ]] || usage_error "missing <vm>"
+
+  CUTOVER_VM=$vm
+  EXIT_HOOK=cutover_report
+  install_traps
+  CUTOVER_STEP="preflight"
+  preflight_node
+  dir=$(vm_dir "$vm") || exit
+  CUTOVER_STEP="load state"
+  state_load "$vm"
+  CUTOVER_ROLLBACK=$(rollback_file "$vm")
+  start_log "$vm" cutover "$@"
+  CUTOVER_STEP="check status, node and VM $VMID"
+
+  case "$STATUS" in
+    prepared) ;;
+    migrated) die "$vm was already migrated (VMID $VMID)" ;;
+    *) die "$vm has status '$STATUS', expected 'prepared'" ;;
+  esac
+  [[ "$NODE" == "$THIS_NODE" ]] ||
+    die "$vm was prepared on node $NODE, run cutover on $NODE (this is $THIS_NODE)"
+  qm config "$VMID" > /dev/null 2>&1 || die "VM $VMID does not exist on this node (qm config failed)"
+  valid_bus "$VM_DISK_BUS" || die "$(state_file "$vm"): invalid or missing VM_DISK_BUS '$VM_DISK_BUS'"
+
+  CUTOVER_STEP="lock check"
+  if vm_locked "$dir"; then
+    if ((wait)); then
+      wait_unlocked "$dir" "$timeout" ||
+        die "$vm is still locked by ESXi after ${timeout}s, shut it down in vCenter" "$EXIT_LOCKED"
+    else
+      die "$vm is still locked by ESXi (lock files present). Shut it down in vCenter first or use --wait" "$EXIT_LOCKED"
+    fi
+  fi
+
+  CUTOVER_STEP="re-check snapshots and disks"
+  recheck_disks "$dir"
+  images="$NFS_PATH/images/$VMID"
+  CUTOVER_STEP="validate targets"
+  validate_cutover "$dir" "$images"
+
+  set_args=(qm set "$VMID")
+  boot="order=$CDROM_SLOT"
+  opts=$(disk_opts "$VM_DISK_BUS")
+  for n in "${!DISK_SOURCES[@]}"; do
+    vol="$NFS_STORE:$VMID/${DISK_TARGETS[n]}"
+    set_args+=("--${DISK_SLOTS[n]}" "$vol${opts:+,$opts}")
+    boot+=";${DISK_SLOTS[n]}"
+  done
+  set_args+=(--boot "$boot")
+
+  printf '\nCutover %s to VMID %s\n' "$vm" "$VMID"
+  for n in "${!DISK_SOURCES[@]}"; do
+    printf '  %s -> %s (%s)\n' "${DISK_SOURCES[n]##*/}" "${DISK_TARGETS[n]}" "${DISK_SLOTS[n]}"
+  done
+  printf '\n'
+  if ((!ASSUME_YES && !DRY_RUN)); then
+    CUTOVER_STEP="confirmation"
+    confirm "Move ${#DISK_SOURCES[@]} flat file(s) and attach them to VM $VMID?" || die "aborted"
+  fi
+
+  rollback=$CUTOVER_ROLLBACK
+  # a fresh rollback file per cutover, an earlier one is archived, not overwritten
+  archived=$(archive_file "$rollback" "$(archive_stamp)") || exit
+  [[ -z "$archived" ]] || info "archived the previous rollback file to $archived"
+  run append_line "$rollback" "# cutover $vm VMID $VMID $(date '+%Y-%m-%d %H:%M:%S')"
+  for n in "${!DISK_SOURCES[@]}"; do
+    src=${DISK_SOURCES[n]}
+    dst="$images/${DISK_TARGETS[n]}"
+    [[ ! -e "$dst" && ! -L "$dst" ]] || die "target $dst appeared, stopping. Undo completed moves with: bash $rollback"
+    CUTOVER_STEP="mv $((n + 1))/${#DISK_SOURCES[@]}: $src -> $dst"
+    size=$(stat -c %s "$src")
+    rc=0
+    CUTOVER_PENDING=("$src" "$dst")
+    run mv -n -- "$src" "$dst" || rc=$?
+    if ((DRY_RUN)); then
+      run append_line "$rollback" "$(quote_cmd mv -n -- "$dst" "$src")"
+    else
+      verify_moved "$src" "$dst" "$size" "$rollback" "$rc"
+    fi
+  done
+
+  CUTOVER_STEP="qm set $VMID (attach disks)"
+  if ! run "${set_args[@]}"; then
+    die "qm set failed, the flat files are already moved. Fix and rerun: $(quote_cmd "${set_args[@]}"), or undo with: bash $rollback"
+  fi
+
+  ((DRY_RUN)) || CUTOVER_ATTACHED=1
+
+  CUTOVER_STEP="save state"
+  STATUS="migrated"
+  # shellcheck disable=SC2034 # persisted by name via state_decl
+  MIGRATED_AT=$(date '+%Y-%m-%dT%H:%M:%S%z')
+  state_save "$vm"
+
+  CUTOVER_STEP="start VM $VMID"
+  if ((start)); then
+    run qm start "$VMID"
+  elif ((!ASSUME_YES && !DRY_RUN)); then
+    if confirm "Start VM $VMID now?"; then
+      run qm start "$VMID"
+    fi
+  fi
+
+  if ((DRY_RUN)); then
+    printf '\nDry run, nothing was changed. %s would be migrated to VMID %s.\n' "$vm" "$VMID"
+  else
+    printf '\n%s migrated to VMID %s.\n' "$vm" "$VMID"
+  fi
+  printf 'Move the disks to their final storage when convenient:\n'
+  for n in "${!DISK_SLOTS[@]}"; do
+    printf '  qm disk move %s %s <TARGET> --delete 1\n' "$VMID" "${DISK_SLOTS[n]}"
+  done
+  CUTOVER_STEP="done"
+}
+
+# ---------------------------------------------------------------------------
+# reset
+# ---------------------------------------------------------------------------
+
+# reset_blockers <images dir> <vm exists 0/1>: print one line per reason why
+# flat files may have been moved. Empty output means reset is safe.
+reset_blockers() {
+  local images=$1 vm_exists=$2 n src dst config=""
+  if ((vm_exists)); then
+    config=$(qm config "$VMID" 2> /dev/null) || config=""
+  fi
+  for n in "${!DISK_SOURCES[@]}"; do
+    src=${DISK_SOURCES[n]}
+    dst="$images/${DISK_TARGETS[n]}"
+    [[ -f "$src" ]] || printf 'source flat %s is missing\n' "$src"
+    [[ ! -e "$dst" && ! -L "$dst" ]] || printf 'target %s exists\n' "$dst"
+    if [[ "$config" == *"$NFS_STORE:$VMID/${DISK_TARGETS[n]}"* ]]; then
+      printf 'VM %s has %s attached\n' "$VMID" "$NFS_STORE:$VMID/${DISK_TARGETS[n]}"
+    fi
+  done
+}
+
+cmd_reset() {
+  local vm="" arg dir images rollback blockers stamp archived vm_exists=0
+  for arg in "$@"; do
+    case "$arg" in
+      --yes) ASSUME_YES=1 ;;
+      --dry-run) DRY_RUN=1 ;;
+      -*) usage_error "unknown option '$arg'" ;;
+      *)
+        [[ -z "$vm" ]] || usage_error "unexpected argument '$arg'"
+        vm=$arg
+        ;;
+    esac
+  done
+  [[ -n "$vm" ]] || usage_error "missing <vm>"
+
+  install_traps
+  preflight_node
+  dir=$(vm_dir "$vm") || exit
+  [[ -f "$(state_file "$vm")" ]] || die "$vm is not prepared, nothing to reset"
+  state_load "$vm"
+  start_log "$vm" reset "$@"
+  rollback=$(rollback_file "$vm")
+
+  case "$STATUS" in
+    prepared) ;;
+    migrated)
+      die "$vm was migrated to VMID $VMID, reset only works for prepared VMs. To undo the cutover, detach the disks from VM $VMID first, then run: bash $rollback"
+      ;;
+    *) die "$vm has status '$STATUS', expected 'prepared'" ;;
+  esac
+  [[ "$NODE" == "$THIS_NODE" ]] ||
+    die "$vm was prepared on node $NODE, run reset on $NODE (this is $THIS_NODE)"
+
+  if qm config "$VMID" > /dev/null 2>&1; then
+    vm_exists=1
+  fi
+  images="$NFS_PATH/images/$VMID"
+  blockers=$(reset_blockers "$images" "$vm_exists")
+  if [[ -n "$blockers" ]]; then
+    die "flat files of $vm may have been moved, refusing to reset:
+${blockers//$'\n'/$'\n'}
+Check the rollback file $rollback"
+  fi
+
+  printf '\nReset %s (VMID %s): archive the state%s\n' "$vm" "$VMID" "$([[ -e "$rollback" ]] && echo " and rollback file")"
+  if ((!ASSUME_YES && !DRY_RUN)); then
+    confirm "Reset $vm?" || die "aborted"
+  fi
+
+  stamp=$(archive_stamp)
+  archived=$(archive_file "$(state_file "$vm")" "$stamp") || exit
+  info "state archived to $archived"
+  archived=$(archive_file "$rollback" "$stamp") || exit
+  [[ -z "$archived" ]] || info "rollback file archived to $archived"
+
+  if ((DRY_RUN)); then
+    printf '\nDry run, nothing was changed.\n'
+  else
+    printf '\n%s reset, it can be prepared again.\n' "$vm"
+  fi
+  if ((vm_exists)); then
+    printf 'VM %s is an empty shell without the migrated disks. Remove it when no longer needed:\n' "$VMID"
+    printf '  qm destroy %s\n' "$VMID"
+  else
+    printf 'VM %s does not exist on this node, nothing to destroy.\n' "$VMID"
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# list
+# ---------------------------------------------------------------------------
+
+# print_table <row>...: rows are tab separated, last column is not padded.
+print_table() {
+  local row i n
+  local -a cols widths=()
+  for row in "$@"; do
+    IFS=$'\t' read -r -a cols <<< "$row"
+    for i in "${!cols[@]}"; do
+      n=${#cols[i]}
+      ((n > ${widths[i]:-0})) && widths[i]=$n
+    done
+  done
+  for row in "$@"; do
+    IFS=$'\t' read -r -a cols <<< "$row"
+    for i in "${!cols[@]}"; do
+      if ((i == ${#cols[@]} - 1)); then
+        printf '%s\n' "${cols[i]}"
+      else
+        printf '%-*s  ' "${widths[i]}" "${cols[i]}"
+      fi
+    done
+  done
+}
+
+# list_disk_check <vm dir>: print the disk count, abort with the reason
+# when the VM cannot be prepared. Meant to run in a subshell.
+list_disk_check() {
+  local dir=$1
+  local -a vmxs=("$dir"/*.vmx)
+  ((${#vmxs[@]} == 1)) || die "${#vmxs[@]} .vmx files in folder"
+  vmx_load "${vmxs[0]}"
+  vm_disk_checks "$dir"
+  printf '%s' "${#DISK_DEVS[@]}"
+}
+
+# list_orphans <vm dir>: print orphaned snapshot files, comma separated.
+# Meant to run in a subshell.
+list_orphans() {
+  local dir=$1
+  local -a vmxs=("$dir"/*.vmx) orphans
+  ((${#vmxs[@]} == 1)) || return 0
+  vmx_load "${vmxs[0]}"
+  mapfile -t orphans < <(orphan_snapshots "$dir")
+  ((${#orphans[@]})) || return 0
+  local IFS=,
+  printf '%s' "${orphans[*]}"
+}
+
+cmd_list() {
+  (($# == 0)) || usage_error "list takes no arguments"
+  [[ -d "$NFS_PATH" ]] || die "NFS path $NFS_PATH does not exist"
+  local dir vm vmid status disks note check orphans
+  local -a vmxs rows=($'VM\tVMID\tSTATUS\tDISKS\tNOTE')
+  for dir in "$NFS_PATH"/*/; do
+    dir=${dir%/}
+    vm=${dir##*/}
+    [[ "$vm" == "images" || "$dir" -ef "$STATE_DIR" ]] && continue
+    vmxs=("$dir"/*.vmx)
+    ((${#vmxs[@]})) || continue
+
+    note=""
+    if [[ -f "$(state_file "$vm")" ]] && ! check=$( (state_load "$vm") 2>&1); then
+      vmid="?"
+      status="invalid"
+      disks="?"
+      note=${check##*$'\n'}
+      note=${note#ERROR: }
+    elif [[ -f "$(state_file "$vm")" ]]; then
+      state_load "$vm"
+      vmid=$VMID
+      disks=${#DISK_SOURCES[@]}
+      case "$STATUS" in
+        migrated) status="migrated" ;;
+        prepared)
+          if vm_locked "$dir"; then status="prepared"; else status="ready"; fi
+          note="node $NODE"
+          ;;
+        *)
+          status=$STATUS
+          note="unknown status"
+          ;;
+      esac
+    else
+      vmid="-"
+      if vm_locked "$dir"; then
+        status="running"
+      else
+        status="new"
+        note="powered off, not prepared"
+      fi
+      if check=$( (list_disk_check "$dir") 2>&1); then
+        disks=$check
+      else
+        disks="?"
+        check=${check##*$'\n'}
+        note="${note:+$note; }${check#ERROR: }"
+      fi
+    fi
+    orphans=$( (list_orphans "$dir") 2> /dev/null) || orphans=""
+    if [[ -n "$orphans" ]]; then
+      note="${note:+$note; }WARNING: orphaned snapshot files ${orphans//,/, }"
+    fi
+    rows+=("$vm"$'\t'"$vmid"$'\t'"$status"$'\t'"$disks"$'\t'"$note")
+  done
+  print_table "${rows[@]}"
+}
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+main() {
+  local cmd=${1:-}
+  [[ -n "$cmd" ]] || usage_error "missing command"
+  shift
+  case "$cmd" in
+    -h | --help | help)
+      usage
+      return 0
+      ;;
+  esac
+  load_config
+  case "$cmd" in
+    list) cmd_list "$@" ;;
+    prepare) cmd_prepare "$@" ;;
+    cutover) cmd_cutover "$@" ;;
+    reset) cmd_reset "$@" ;;
+    *) usage_error "unknown command '$cmd'" ;;
+  esac
+}
+
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+  main "$@"
+fi

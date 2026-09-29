@@ -1,0 +1,33 @@
+# vmxodus configuration. Copy to /etc/vmxodus.conf and adjust. Sourced as bash.
+# Only NFS_STORE is required, every other line shows the built-in default.
+
+# PVE storage ID (type nfs) of the share ESXi and PVE both mount (required)
+NFS_STORE="migration-nfs"
+# Mountpoint of the share, empty means /mnt/pve/$NFS_STORE
+NFS_PATH=""
+# State, logs, rollback files and portgroups.map, empty means $NFS_PATH/.vmxodus
+STATE_DIR=""
+# CPU type for qm create --cpu (PVE default x86-64-v2-AES)
+CPU_TYPE="x86-64-v2-AES"
+# NUMA flag for qm create --numa
+NUMA="1"
+# Hotplug features for qm create --hotplug
+HOTPLUG="disk,network,usb"
+# SCSI controller for qm create --scsihw
+SCSIHW="virtio-scsi-single"
+# Options appended to every attached disk (iothread is dropped for sata, ssd for virtio)
+DISK_OPTS="discard=on,iothread=1,ssd=1"
+# Disk bus scsi, sata or virtio, overridable per VM with prepare --disk-bus=
+DISK_BUS="scsi"
+# NIC model for --netN
+NIC_MODEL="virtio"
+# Bridge offered for NICs whose portgroup is not in portgroups.map
+DEFAULT_BRIDGE="vmbr0"
+# Slot of the empty CD-ROM drive, also first in the boot order
+CDROM_SLOT="ide0"
+# Storage for efidisk0 of UEFI guests, empty means $NFS_STORE
+EFI_STORE=""
+# QEMU guest agent flag for qm create --agent
+AGENT="1"
+# Extra qm create options as key=value, e.g. ("tags=migrated" "onboot=1")
+EXTRA_OPTS=()
