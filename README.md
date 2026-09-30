@@ -52,6 +52,59 @@ $EDITOR /etc/vmxodus.conf   # set NFS_STORE at least
 
 ## Usage
 
+### Workflow
+
+Run all vmxodus commands as root on a PVE node. The guest preparation from [Before you migrate](#before-you-migrate) should be done first.
+
+**1. Move the disks to the share (vSphere, VM keeps running)**
+
+Disable backup jobs for the VM, delete all snapshots and wait for consolidation. Then migrate the VM with *Migrate > Change storage only* to the NFS datastore. This is the actual data transfer and runs without downtime.
+
+**2. Check the status**
+
+```bash
+vmxodus list
+```
+
+The VM shows up as `running` while it is still powered on in VMware. The note column warns about snapshots or leftover delta files.
+
+**3. Prepare the PVE VM (VM keeps running)**
+
+```bash
+vmxodus prepare <vm> --dry-run
+vmxodus prepare <vm>
+```
+
+vmxodus reads the `.vmx`, asks once per portgroup which bridge and VLAN tag to use, shows a summary and creates an empty VM with the same CPU, memory, firmware and MAC addresses. The flat files are not touched. This can be done hours or days before the cutover.
+
+**4. Cut over (downtime starts)**
+
+Shut the VM down in vCenter and remove it from the inventory (*Remove from Inventory*, not *Delete from Disk*). Then run on the same node as `prepare`:
+
+```bash
+vmxodus cutover <vm> --start
+```
+
+Or start `cutover` first and let it wait for the shutdown:
+
+```bash
+vmxodus cutover <vm> --wait=600 --start
+```
+
+vmxodus waits until the ESXi lock files are gone, checks snapshots and disks again, moves the flat files into the PVE image directory, attaches them and starts the VM. The downtime is the shutdown plus the boot.
+
+**5. Move the disks to their final storage (VM keeps running)**
+
+```bash
+qm disk move <vmid> scsi0 <target-storage> --delete 1
+```
+
+`cutover` prints the exact commands for every disk. Once the VM runs fine, delete the vSphere VM folder on the share.
+
+If something goes wrong before step 5, see [Rollback](#rollback).
+
+### Commands
+
 ```
 vmxodus list
 vmxodus prepare <vm> [--vmid=<id>] [--disk-bus=<bus>] [--set key=value]... [--yes] [--dry-run]
@@ -59,20 +112,26 @@ vmxodus cutover <vm> [--start] [--wait[=<seconds>]] [--yes] [--dry-run]
 vmxodus reset <vm> [--yes] [--dry-run]
 ```
 
-`reset` undoes `prepare` as long as no flat file was moved: it archives the state and rollback file and prints the `qm destroy` command for the empty PVE VM without running it. Migrated VMs are refused.
+`<vm>` is the VM folder name on the share. `--dry-run` prints every mutating command instead of running it. `--yes` skips all confirmations; with `prepare` it only works when every portgroup is already in the mapping file.
 
-`<vm>` is the VM folder name on the share. `--dry-run` prints every mutating command instead of running it.
+`reset` undoes `prepare` as long as no flat file has been moved. It archives the state and rollback file and prints the command to remove the empty PVE VM without running it. Migrated VMs are refused.
 
-Disks are attached on the bus from `DISK_BUS` or `--disk-bus=` (scsi, sata or virtio). Additional `qm create` options come from `EXTRA_OPTS` in the config, `--set key=value` or the interactive prompt after the summary. Precedence, low to high: defaults, config, values from the `.vmx`, `--set`/prompt. Disk slots, `boot`, the firmware (`bios`, always taken from the `.vmx`), `efidisk0` and `vmid` are managed by vmxodus and cannot be set.
+### Disk bus and extra options
 
-Portgroup to bridge assignments are kept in `<STATE_DIR>/portgroups.map` (tab separated: key, bridge, tag, label; `-` means empty) and offered as defaults next time:
+Disks are attached on the bus from `DISK_BUS` or `--disk-bus=` (scsi, sata or virtio). Additional `qm create` options come from `EXTRA_OPTS` in the config, `--set key=value` or the interactive prompt after the summary. Precedence, low to high: defaults, config, values from the `.vmx`, `--set` and prompt. Disk slots, `boot`, the firmware (`bios`, always taken from the `.vmx`), `efidisk0` and `vmid` are managed by vmxodus and cannot be set.
+
+### Network mapping
+
+Portgroup to bridge assignments are kept in `<STATE_DIR>/portgroups.map` (tab separated: key, bridge, tag, label; `-` means empty) and offered as defaults for the next VM:
 
 ```
 dvportgroup-1001	vmbr1	34	dmz-servers
 VM Network	vmbr0	-	-
 ```
 
-State, logs and rollback files live in `<STATE_DIR>` on the share. `cutover` must run on the node where `prepare` ran. Each completed `mv` is recorded in `<vm>.rollback` as its reverse `mv`; the file holds only the current cutover, earlier ones are archived as `<vm>.rollback.<timestamp>`.
+### State and logs
+
+State, logs and rollback files live in `<STATE_DIR>` on the share, so `list` works from every node. `cutover` must run on the node where `prepare` ran. Each completed `mv` is recorded in `<vm>.rollback` as its reverse `mv`. The file only holds the current cutover, earlier ones are archived as `<vm>.rollback.<timestamp>`.
 
 ## Safety
 
@@ -95,9 +154,9 @@ bash <STATE_DIR>/<vm>.rollback
 
 **`qm destroy` deletes every disk volume of the VM, attached or unused.** Never run it, and never remove disks in the GUI, while migrated flat files are still in `images/<VMID>`.
 
-Rollback only works:
+A rollback is clean only:
 
-- before the VM was started in PVE. Once the guest has run on PVE, its disks have changed and the guest was adapted to the new hardware.
+- before the VM was started in PVE. After a boot on PVE the files can still be moved back, but the guest has already written to its disks and may have adapted to the new hardware.
 - before the disks were moved to another storage. `qm disk move ... --delete 1` removes the raw files on the share.
 
 ## Limitations
