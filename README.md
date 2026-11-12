@@ -20,9 +20,9 @@ Afterwards, move the disks to their final storage with `qm disk move` or the GUI
 
 - VMware ESXi 8.0 with vCenter 8.0, VMs on an NFS v3 datastore
 - Proxmox VE 9.2 (pve-manager/9.2.20) with NFS storage
-- Guests Debian 13 and Ubuntu 24.04: BIOS, pvscsi, vmxnet3, two disks
-
-Windows and UEFI guests are supported by the code but not yet tested on real hardware.
+- Debian 13
+- Ubuntu 24.04
+- Windows Server 2022 Standard
 
 ## Before you migrate
 
